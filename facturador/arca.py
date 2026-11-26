@@ -208,6 +208,19 @@ class WSFE:
             raise ErrorARCA("; ".join(errs))
         return int(res.findtext("{*}CbteNro") or 0)
 
+    def puntos_venta(self) -> list[dict]:
+        """Puntos de venta habilitados para web services en ARCA."""
+        res = self._llamar("FEParamGetPtosVenta", self._auth())
+        out = []
+        for pv in res.findall(".//{*}PtoVenta"):
+            out.append({"Nro": int(pv.findtext("{*}Nro") or 0), "Tipo": pv.findtext("{*}EmisionTipo") or "",
+                        "Bloqueado": pv.findtext("{*}Bloqueado") or "", "Baja": pv.findtext("{*}FchBaja") or ""})
+        if not out:
+            errs = self._errores(res)
+            if errs and not any(e.startswith("602") for e in errs):  # 602 = sin resultados
+                raise ErrorARCA("; ".join(errs))
+        return out
+
     def cotizacion(self, mon_id: str) -> float:
         res = self._llamar("FEParamGetCotizacion", f"{self._auth()}<ar:MonId>{mon_id}</ar:MonId>")
         errs = self._errores(res)
