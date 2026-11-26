@@ -376,6 +376,22 @@ with tab_cli:
         if st.button("🔌 Probar conexión", disabled=not (cert and clave)):
             try:
                 ws = WSFE(WSAA(cuit_a, cert, clave, actual.get("entorno", "homologacion"), alm))
+                pvs = ws.puntos_venta()
+                activos = [p["Nro"] for p in pvs if p["Bloqueado"] != "S" and p["Baja"] in ("", "NULL")]
+                if pvs:
+                    st.markdown("**Puntos de venta habilitados para web services en ARCA:**")
+                    st.table(pd.DataFrame([{"Punto de venta": p["Nro"], "Tipo": p["Tipo"],
+                                            "Bloqueado": p["Bloqueado"], "Baja": p["Baja"]} for p in pvs]))
+                elif actual.get("entorno") == "produccion":
+                    st.error("Este cliente NO tiene ningún punto de venta para web services en ARCA. Crealo en "
+                             "'Administración de puntos de venta y domicilios' con el sistema 'RECE para aplicativo "
+                             "y web services' (RI) o 'Factura Electrónica - Monotributo - Web Services'.")
+                    st.stop()
+                if pvs and actual["pto_vta"] not in activos:
+                    st.error(f"El punto de venta cargado en la app ({actual['pto_vta']}) no está en esa lista. "
+                             f"Cambialo por uno de estos: {', '.join(map(str, activos)) or 'ninguno activo'} "
+                             "y guardá los datos del cliente.")
+                    st.stop()
                 letras = sorted(T.LETRAS_POR_EMISOR[actual["cond_iva"]] - {"M"})
                 filas = []
                 for letra in letras:
