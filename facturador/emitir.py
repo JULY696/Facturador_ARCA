@@ -53,7 +53,14 @@ def emitir_lote(cbtes: list[dict], almacen: Almacen, simulacion: bool, archivo_e
                 r = ws.autorizar(pedido)
             except Exception as ex_red:
                 # Si se cortó la conexión, verificamos si ARCA llegó a autorizarlo antes de reintentar
-                cons = ws.consultar(c["pto_vta"], c["tipo_cod"], nro)
+                try:
+                    cons = ws.consultar(c["pto_vta"], c["tipo_cod"], nro)
+                except Exception:
+                    raise ErrorARCA(
+                        f"⚠️ Se cortó la conexión con ARCA justo al pedir el CAE y no se pudo confirmar si quedó "
+                        f"emitido. ANTES DE REINTENTAR, tocá 'Probar conexión' en el cliente: si el último "
+                        f"autorizado de este tipo es {nro}, la factura SÍ se emitió (buscala en Mis Comprobantes). "
+                        f"Detalle: {ex_red}")
                 if cons and cons.get("CAE") and abs(cons["ImpTotal"] - c["total"]) < 0.01:
                     r = {"resultado": "A", "CAE": cons["CAE"], "CAEFchVto": cons["CAEFchVto"],
                          "errores": [], "observaciones": ["Recuperado por consulta tras corte de conexión"]}

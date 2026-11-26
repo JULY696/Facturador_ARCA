@@ -58,9 +58,26 @@ def _sesion() -> requests.Session:
     return s
 
 
-def _post_soap(url: str, cuerpo: str, accion: str = "") -> etree._Element:
+def _post_soap(url: str, cuerpo: str, accion: str = "", intentos: int = 3) -> etree._Element:
+    """intentos > 1 solo para consultas que se pueden repetir sin riesgo (no para pedir el CAE)."""
     headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": accion}
-    r = _sesion().post(url, data=cuerpo.encode("utf-8"), headers=headers, timeout=60)
+    servidor = url.split("/")[2]
+    for n in range(1, intentos + 1):
+        try:
+            r = _sesion().post(url, data=cuerpo.encode("utf-8"), headers=headers, timeout=60)
+            break
+        except requests.exceptions.ConnectionError as ex:
+            if n < intentos:
+                time.sleep(3 * n)
+                continue
+            raise ErrorARCA(f"No se pudo conectar con ARCA ({servidor}) después de {intentos} intento(s). "
+                            f"Suele ser una caída momentánea de ARCA: probá de nuevo en unos minutos. "
+                            f"Detalle técnico: {ex}")
+        except requests.exceptions.Timeout:
+            raise ErrorARCA(f"ARCA ({servidor}) no respondió a tiempo. Probá de nuevo en unos minutos.")
+    if r.status_code >= 500 and not r.content.strip().startswith(b"<"):
+        raise ErrorARCA(f"ARCA respondió con un error del servidor (HTTP {r.status_code}). "
+                        "Suele ser momentáneo: probá de nuevo en unos minutos.")
     try:
         raiz = etree.fromstring(r.content)
     except etree.XMLSyntaxError:
@@ -193,7 +210,8 @@ class WSFE:
             f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ar="{NS_FE}">'
             f"<soapenv:Header/><soapenv:Body><ar:{metodo}>{interior}</ar:{metodo}></soapenv:Body></soapenv:Envelope>"
         )
-        raiz = _post_soap(self.url, cuerpo, NS_FE + metodo)
+        # pedir el CAE no se reintenta a ciegas: si se corta, emitir.py consulta si quedó autorizado
+        raiz = _post_soap(self.url, cuerpo, NS_FE + metodo, intentos=1 if metodo == "FECAESolicitar" else 3)
         return raiz.find(f".//{{{NS_FE}}}{metodo}Result")
 
     @staticmethod
