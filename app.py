@@ -252,7 +252,9 @@ with tab_cli:
                 st.rerun()
 
     opciones = ["➕ Nuevo cliente"] + [f"{c.get('razon_social')} ({c['cuit']})" for c in clientes.values()]
-    elegido = st.selectbox("Cliente", opciones)
+    sel = st.session_state.pop("cliente_recien_guardado", None)
+    idx = next((i for i, o in enumerate(opciones) if sel and o.endswith(f"({sel})")), 0)
+    elegido = st.selectbox("Cliente", opciones, index=idx)
     actual = {} if elegido.startswith("➕") else clientes[elegido.split("(")[-1].rstrip(")")]
 
     st.markdown("#### 1 · Datos fiscales (salen en la factura)")
@@ -287,20 +289,29 @@ with tab_cli:
                               help="SCA = Sistema de Circulación Abierta · ADC = Agente de Depósito Colectivo")
         if st.form_submit_button("💾 Guardar datos", type="primary"):
             cuit_n = "".join(ch for ch in (cuit or actual.get("cuit", "")) if ch.isdigit())
-            if not cuit_valido(cuit_n):
-                st.error("El CUIT no es válido")
-            elif not razon or not domicilio or not pv:
-                st.error("Completá razón social, domicilio y punto de venta")
+            faltan = [n for n, v in (("Razón social", razon), ("Domicilio comercial", domicilio),
+                                     ("Punto de venta (no puede ser 0)", pv)) if not v]
+            if len(cuit_n) != 11:
+                st.error(f"❌ NO SE GUARDÓ: el CUIT tiene que tener 11 números (tiene {len(cuit_n)}).")
+            elif not cuit_valido(cuit_n):
+                st.error(f"❌ NO SE GUARDÓ: el CUIT {cuit_n} no es válido (revisá el último dígito).")
+            elif faltan:
+                st.error("❌ NO SE GUARDÓ: falta completar " + ", ".join(faltan) + ".")
             elif cbu and len("".join(ch for ch in cbu if ch.isdigit())) != 22:
-                st.error("El CBU tiene que tener 22 dígitos")
+                st.error("❌ NO SE GUARDÓ: el CBU tiene que tener 22 dígitos (o dejalo vacío).")
             else:
-                alm.guardar({"cuit": cuit_n, "razon_social": razon, "nombre_fantasia": fantasia,
-                             "domicilio": domicilio, "cond_iva": cond, "iibb": iibb, "inicio_act": inicio,
-                             "pto_vta": int(pv), "concepto": concepto, "leyenda_fija": leyenda,
-                             "email": email, "entorno": entorno,
-                             "cbu": "".join(ch for ch in cbu if ch.isdigit()), "alias_cbu": alias_cbu,
-                             "fce_transferencia": fce_tr})
-                st.success("Cliente guardado")
+                try:
+                    alm.guardar({"cuit": cuit_n, "razon_social": razon, "nombre_fantasia": fantasia,
+                                 "domicilio": domicilio, "cond_iva": cond, "iibb": iibb, "inicio_act": inicio,
+                                 "pto_vta": int(pv), "concepto": concepto, "leyenda_fija": leyenda,
+                                 "email": email, "entorno": entorno,
+                                 "cbu": "".join(ch for ch in cbu if ch.isdigit()), "alias_cbu": alias_cbu,
+                                 "fce_transferencia": fce_tr})
+                except Exception as ex:
+                    st.error(f"❌ NO SE GUARDÓ: error al guardar en el Drive: {ex}")
+                    st.stop()
+                st.session_state.cliente_recien_guardado = cuit_n
+                st.toast("✅ Cliente guardado")
                 st.rerun()
 
     if actual:
