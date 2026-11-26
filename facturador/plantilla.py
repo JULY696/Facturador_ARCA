@@ -169,15 +169,17 @@ def generar_plantilla(clientes: list[dict] | None = None) -> bytes:
         [2, cuit_ej, "FB" if es_ri else "FC", None, hoy, "Productos", None, None, None, "DNI", "30111222",
          "Juan Pérez", "", "Consumidor Final", "Contado", "Pesos", None, "S", None, None, None, None, "", ""],
     ]
+    ws_ej = wb.create_sheet("Ejemplo")
+    ws_ej.append([t for _k, t, _a in COLS_CBTE])
     for fila in ej_c:
-        wc.append(fila)
+        ws_ej.append(fila)
+    ws_ej.append([])
+    ws_ej.append([t for _k, t, _a in COLS_ITEM])
     for fila in ([1, "", "Asesoramiento contable mensual", 1, "servicio", 150000, None, "21"],
                  [2, "P-001", "Producto de ejemplo", 2, "unidades", 12100, 10, "21"]):
-        wi.append(fila)
-    for ws in (wc, wi):
-        for row in ws.iter_rows(min_row=2, max_row=3):
-            for cell in row:
-                cell.font = Font(italic=True, color="808080")
+        ws_ej.append(fila)
+    ws_ej["A9"] = "Esta hoja es solo un ejemplo y NO se factura. Cargá en las hojas Comprobantes e Items."
+    ws_ej["A9"].font = Font(bold=True, color="C00000")
     ws_ayuda = wb.create_sheet("Ayuda", 0)
     texto = [
         "FACTURADOR ARCA — ESTUDIO MARSAN",
@@ -185,7 +187,7 @@ def generar_plantilla(clientes: list[dict] | None = None) -> bytes:
         "1. Hoja Comprobantes: una fila por factura / nota de crédito / nota de débito.",
         "2. Hoja Items: una fila por cada producto o servicio. Se une con el comprobante por el ID.",
         "3. Hoja Tributos: percepciones u otros tributos (opcional).",
-        "4. Las filas grises son ejemplos: borralas o reemplazalas.",
+        "4. En la hoja 'Ejemplo' hay facturas de muestra (esa hoja no se factura).",
         "5. Pasá el mouse sobre cada título para ver qué va en la columna.",
         "",
         "Precios: en Factura A/B/M el precio va SIN IVA, salvo que pongas 'S' en 'Precios con IVA incluido'.",
@@ -210,6 +212,133 @@ def generar_plantilla(clientes: list[dict] | None = None) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ------------------------------------------------------------------ plantilla SIMPLE
+COLS_SIMPLE = [
+    # (clave, título, ayuda, obligatoria)
+    ("cliente", "Cliente que factura", "Elegí de la lista (CUIT - nombre).", True),
+    ("doc", "CUIT o DNI del receptor", "Sin guiones. Vacío = Consumidor Final sin identificar.", False),
+    ("nombre", "Nombre del receptor", "", False),
+    ("cond_iva", "Condición IVA del receptor", "Vacío = Consumidor Final. Si es Responsable Inscripto o Monotributo, elegilo de la lista.", False),
+    ("descripcion", "Descripción", "Lo que sale en la factura. Ej: Honorarios noviembre 2026", True),
+    ("importe", "Importe total", "El total FINAL a cobrar (con IVA incluido si corresponde).", True),
+    ("email", "Email del receptor", "Opcional. Varios separados por ;", False),
+    ("enviar_mail", "Enviar por mail (S/N)", "S = se le manda el PDF por mail. Vacío = no.", False),
+    ("fecha", "Fecha", "Opcional. Vacío = hoy.", False),
+    ("tipo", "Tipo (opcional)", "Vacío = automático (C si es monotributista; A o B si es Responsable Inscripto).", False),
+    ("iva", "IVA % (opcional)", "Solo clientes Responsables Inscriptos. Vacío = 21.", False),
+]
+GRIS = PatternFill("solid", fgColor="7F7F7F")
+
+
+def generar_plantilla_simple(clientes: list[dict] | None = None) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Facturas"
+    for j, (_k, titulo, ayuda, oblig) in enumerate(COLS_SIMPLE, start=1):
+        c = ws.cell(row=1, column=j, value=titulo + (" *" if oblig else ""))
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = AZUL if oblig else GRIS
+        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        if ayuda:
+            c.comment = Comment(ayuda, "Facturador")
+    anchos = [34, 18, 28, 26, 42, 16, 28, 12, 12, 10, 10]
+    for j, w in enumerate(anchos, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = w
+    ws.row_dimensions[1].height = 34
+    ws.freeze_panes = "A2"
+    for r in range(2, 501):
+        ws[f"F{r}"].number_format = "#,##0.00"
+        ws[f"I{r}"].number_format = "DD/MM/YYYY"
+
+    wl = wb.create_sheet("Listas")
+    opciones_cli = [f"{c['cuit']} - {c.get('razon_social', '')}" for c in (clientes or [])]
+    listas = {"A": opciones_cli, "B": list(T.COND_IVA_RECEPTOR), "C": ["S", "N"],
+              "D": ["FC", "FA", "FB", "NCC", "NCA", "NCB"], "E": ["21", "10.5", "27", "5", "2.5", "0", "Exento"]}
+    for col, vals in listas.items():
+        for r, v in enumerate(vals, start=1):
+            wl[f"{col}{r}"] = v
+    wl.sheet_state = "hidden"
+
+    def dv(col_l, n, rango):
+        if n:
+            v = DataValidation(type="list", formula1=f"=Listas!${col_l}$1:${col_l}${n}", allow_blank=True)
+            v.showErrorMessage = False
+            ws.add_data_validation(v)
+            v.add(rango)
+    dv("A", len(opciones_cli), "A2:A500")
+    dv("B", len(listas["B"]), "D2:D500")
+    dv("C", 2, "H2:H500")
+    dv("D", len(listas["D"]), "J2:J500")
+    dv("E", len(listas["E"]), "K2:K500")
+
+    # Ejemplo en una hoja aparte (así nunca se factura por error)
+    we = wb.create_sheet("Ejemplo")
+    for j, (_k, titulo, _a, oblig) in enumerate(COLS_SIMPLE, start=1):
+        c = we.cell(row=1, column=j, value=titulo + (" *" if oblig else ""))
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = AZUL if oblig else GRIS
+        we.column_dimensions[c.column_letter].width = anchos[j - 1]
+    for fila in (
+        ["20111111112 - TU CLIENTE", "30712345671", "Empresa Ejemplo S.A.", "IVA Responsable Inscripto",
+         "Honorarios profesionales noviembre 2026", 150000, "pagos@empresa.com", "S"],
+        ["20111111112 - TU CLIENTE", "", "", "", "Servicio a consumidor final", 20000],
+        ["20111111112 - TU CLIENTE", "27222333", "María Gómez", "Responsable Monotributo", "Diseño de logo", 80000],
+    ):
+        we.append(fila)
+    we["A6"] = ("Esta hoja es solo un ejemplo y NO se factura. Cargá tus facturas en la hoja 'Facturas'. "
+                "Columnas azules (*) = obligatorias; grises = opcionales.")
+    we["A6"].font = Font(bold=True, color="C00000")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _convertir_simple(wb, clientes: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+    """Pasa la hoja simple 'Facturas' al formato completo (Comprobantes + Items)."""
+    cols = [(k, t, a) for k, t, a, _o in COLS_SIMPLE]
+    filas = _leer_hoja(wb, "Facturas", cols + [(k, t + " *", a) for k, t, a in cols])
+    cbtes, items = [], []
+    n = 0
+    for f in filas:
+        if str(f.get("cliente") or "").startswith("←"):
+            continue  # la nota de ayuda
+        n += 1
+        texto_cli = re.sub(r"[-.\s]", "", str(f.get("cliente") or ""))
+        m = re.search(r"\d{11}", texto_cli)
+        cuit = m.group(0) if m else ""
+        cli = clientes.get(cuit, {})
+        doc = _solo_digitos(f.get("doc"))
+        if not doc:
+            doc_tipo = "Sin identificar"
+        elif len(doc) == 11:
+            doc_tipo = "CUIT"
+        elif 6 <= len(doc) <= 8:
+            doc_tipo = "DNI"
+        else:
+            doc_tipo = "CUIT"  # que lo marque la validación
+        cond = _buscar(T.COND_IVA_RECEPTOR, f.get("cond_iva"), ALIAS_COND_IVA) or (f.get("cond_iva") or "Consumidor Final")
+        tipo = str(f.get("tipo") or "").strip().upper()
+        if not tipo:
+            if cli.get("cond_iva") == "IVA Responsable Inscripto":
+                tipo = "FA" if cond in ("IVA Responsable Inscripto", "Responsable Monotributo", "Monotributista Social",
+                                        "Monotributo Trabajador Independiente Promovido") else "FB"
+            else:
+                tipo = "FC"
+        concepto = cli.get("concepto") or "Servicios"
+        cbtes.append({
+            "_fila": f["_fila"], "id": n, "cuit_emisor": cuit, "tipo": tipo, "fecha": f.get("fecha"),
+            "concepto": concepto, "doc_tipo": doc_tipo, "doc_nro": doc, "rec_nombre": f.get("nombre"),
+            "rec_cond_iva": cond, "cond_venta": "Contado", "precios_con_iva": "S",
+            "email": f.get("email"), "enviar_mail": f.get("enviar_mail"),
+        })
+        items.append({
+            "_fila": f["_fila"], "id": n, "descripcion": f.get("descripcion"), "cantidad": 1,
+            "unidad": "servicio" if concepto == "Servicios" else "unidades",
+            "precio": f.get("importe"), "alicuota": f.get("iva") or "21",
+        })
+    return cbtes, items
 
 
 # ------------------------------------------------------------------ lectura
@@ -305,11 +434,17 @@ def leer_excel(contenido: bytes, clientes: dict[str, dict], hoy: dt.date | None 
     Cada uno trae 'errores' (bloquean la emisión) y 'avisos' (no bloquean)."""
     hoy = hoy or dt.date.today()
     wb = load_workbook(io.BytesIO(contenido), data_only=True)
-    cbtes = _leer_hoja(wb, "Comprobantes", COLS_CBTE)
-    items = _leer_hoja(wb, "Items", COLS_ITEM)
-    tribs = _leer_hoja(wb, "Tributos", COLS_TRIB)
-    if not cbtes:
-        raise ValueError("No encontré la hoja 'Comprobantes' o está vacía. Usá la plantilla de la app.")
+    if "Facturas" in wb.sheetnames:  # plantilla simple
+        cbtes, items = _convertir_simple(wb, clientes)
+        tribs = []
+        if not cbtes:
+            raise ValueError("La hoja 'Facturas' está vacía.")
+    else:
+        cbtes = _leer_hoja(wb, "Comprobantes", COLS_CBTE)
+        items = _leer_hoja(wb, "Items", COLS_ITEM)
+        tribs = _leer_hoja(wb, "Tributos", COLS_TRIB)
+        if not cbtes:
+            raise ValueError("El Excel no tiene facturas cargadas (o no es una plantilla de la app).")
 
     def clave_id(v):
         if isinstance(v, float) and v.is_integer():

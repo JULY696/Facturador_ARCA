@@ -16,7 +16,7 @@ from facturador.arca import (WSAA, WSFE, ErrorARCA, clave_coincide, generar_clav
 from facturador.clientes import Almacen, AlmacenNube, ErrorNube
 from facturador.emitir import emitir_lote
 from facturador import mailer
-from facturador.plantilla import cuit_valido, generar_plantilla, leer_excel
+from facturador.plantilla import cuit_valido, generar_plantilla, generar_plantilla_simple, leer_excel
 
 st.set_page_config(page_title="Facturador ARCA · Estudio Marsan", page_icon="🧾", layout="wide")
 
@@ -102,11 +102,17 @@ tab_fact, tab_cli, tab_hist, tab_mail = st.tabs(["📤 Facturar", "👥 Clientes
 # ================================================================== FACTURAR
 with tab_fact:
     st.subheader("1 · Bajá la plantilla y completala")
-    st.download_button("⬇️ Descargar plantilla Excel", generar_plantilla(list(clientes.values())),
-                       "plantilla_facturacion.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.caption("Hojas: Comprobantes (una fila por factura), Items (los renglones), Tributos (percepciones, opcional). "
-               "Pasá el mouse por los títulos para ver qué va en cada columna.")
+    c_simple, c_compl = st.columns(2)
+    with c_simple:
+        st.download_button("⬇️ Plantilla SIMPLE (recomendada)", generar_plantilla_simple(list(clientes.values())),
+                           "facturas_simple.xlsx", type="primary",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption("Una fila por factura: cliente, receptor, descripción e importe total. Lo demás se completa solo.")
+    with c_compl:
+        st.download_button("⬇️ Plantilla completa", generar_plantilla(list(clientes.values())),
+                           "plantilla_facturacion.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption("Para varios ítems por factura, percepciones, notas de crédito, FCE o dólares.")
 
     st.subheader("2 · Subí el Excel")
     archivo = st.file_uploader("Excel de facturación", type=["xlsx", "xlsm"], label_visibility="collapsed")
