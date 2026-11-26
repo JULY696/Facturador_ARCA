@@ -814,11 +814,19 @@ with tab_mail:
     a, b = st.columns([2, 1])
     destino_prueba = a.text_input("Mandar un mail de prueba a", cfg_mail.get("remitente_email", ""))
     if b.button("✉️ Probar envío", disabled=not mail_ok):
-        try:
-            mailer.probar(cfg_mail, destino_prueba)
-            st.success(f"Mail de prueba enviado a {destino_prueba}")
-        except Exception as ex:
-            st.error(f"No se pudo enviar: {ex}")
+        with st.spinner("Probando la conexión con el servidor de mail…"):
+            lineas, funciona = mailer.diagnosticar(cfg_mail, destino_prueba)
+        for l in lineas:
+            (st.success if l.startswith("✅") else st.error)(l)
+        if funciona:
+            if (funciona["puerto"], funciona["seguridad"]) != (int(cfg_mail.get("puerto", 0)), cfg_mail.get("seguridad")):
+                alm.guardar_config_mail({**cfg_mail, "puerto": funciona["puerto"], "seguridad": funciona["seguridad"]})
+                st.info(f"Guardé la configuración que funcionó: puerto {funciona['puerto']} · {funciona['seguridad']}.")
+            st.success(f"Revisá la bandeja de {destino_prueba}: tiene que haber llegado el mail de prueba.")
+        else:
+            st.caption("Hostinger: servidor smtp.hostinger.com, puerto 465 SSL, usuario = la casilla completa y "
+                       "contraseña = la de la casilla (hPanel → Emails). Si todo está bien y sigue fallando, "
+                       "mandá captura de estos mensajes.")
     with st.expander("☁️ Configuración para la versión web"):
         st.caption("Pegar en Streamlit Cloud → Settings → Secrets:")
         st.code("[mail]\n" + "\n".join(
