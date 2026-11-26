@@ -103,10 +103,13 @@ class Mailer:
     def __enter__(self):
         c = self.cfg
         ctx = ssl.create_default_context()
+        # nombre de equipo prolijo: algunos servidores cortan la conexión si el de la máquina no es válido
+        host = (c.get("remitente_email") or "localhost").split("@")[-1]
         if c["seguridad"] == "SSL":
-            self.smtp = smtplib.SMTP_SSL(c["servidor"], int(c["puerto"]), context=ctx, timeout=30)
+            self.smtp = smtplib.SMTP_SSL(c["servidor"], int(c["puerto"]), context=ctx, timeout=30,
+                                         local_hostname=host)
         else:
-            self.smtp = smtplib.SMTP(c["servidor"], int(c["puerto"]), timeout=30)
+            self.smtp = smtplib.SMTP(c["servidor"], int(c["puerto"]), timeout=30, local_hostname=host)
             if c["seguridad"] == "STARTTLS":
                 self.smtp.starttls(context=ctx)
         if c.get("usuario"):
@@ -159,3 +162,42 @@ def probar(cfg: dict, destino: str):
     msg.set_content("Si recibiste este mail, el envío de facturas está bien configurado.")
     with Mailer(cfg) as m:
         m.enviar(msg)
+
+
+def diagnosticar(cfg: dict, destino: str) -> tuple[list[str], dict | None]:
+    """Prueba la configuración paso a paso y, si falla, las alternativas habituales.
+    Devuelve (líneas de diagnóstico, configuración que funcionó o None)."""
+    cfg = {**DEFECTO, **cfg}
+    combos = [(cfg["servidor"], int(cfg["puerto"]), cfg["seguridad"])]
+    for alt in ((cfg["servidor"], 465, "SSL"), (cfg["servidor"], 587, "STARTTLS")):
+        if alt not in combos:
+            combos.append(alt)
+    lineas = []
+    for servidor, puerto, seg in combos:
+        prueba = {**cfg, "servidor": servidor, "puerto": puerto, "seguridad": seg}
+        et = f"{servidor}:{puerto} ({seg})"
+        paso = "conectar"
+        try:
+            with Mailer({**prueba, "usuario": ""}) as m:  # conectar sin login
+                pass
+            paso = "iniciar sesión"
+            with Mailer(prueba) as m:
+                paso = "enviar"
+                msg = EmailMessage()
+                msg["From"] = formataddr((cfg["remitente_nombre"], cfg["remitente_email"]))
+                msg["To"] = destino
+                msg["Subject"] = "Prueba del Facturador ARCA - Estudio Marsan"
+                msg.set_content("Si recibiste este mail, el envío de facturas está bien configurado.")
+                m.enviar(msg)
+            lineas.append(f"✅ {et}: conectó, inició sesión y envió el mail.")
+            return lineas, prueba
+        except smtplib.SMTPAuthenticationError:
+            lineas.append(f"❌ {et}: conecta bien, pero el USUARIO o la CONTRASEÑA son incorrectos.")
+            return lineas, None  # probar otros puertos no arregla una contraseña mal
+        except smtplib.SMTPSenderRefused as ex:
+            lineas.append(f"❌ {et}: el servidor no acepta enviar como {cfg['remitente_email']} "
+                          f"(el remitente tiene que ser la misma casilla del usuario). {ex}")
+            return lineas, None
+        except Exception as ex:
+            lineas.append(f"❌ {et}: falló al {paso}: {type(ex).__name__}: {ex}")
+    return lineas, None
