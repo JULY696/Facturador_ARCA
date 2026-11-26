@@ -3,8 +3,10 @@ Subís un Excel con las facturas de tus clientes y la app pide el CAE a ARCA con
 """
 from __future__ import annotations
 
+import datetime as dt
 import io
 import os
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import streamlit as st
 
 from facturador import tablas as T
 from facturador.arca import (WSAA, WSFE, ErrorARCA, clave_coincide, generar_clave_y_csr, info_certificado)
-from facturador.clientes import Almacen, AlmacenNube, ErrorNube
+from facturador.clientes import Almacen, AlmacenNube, ErrorNube, num
 from facturador.emitir import emitir_lote
 from facturador import mailer
 from facturador.plantilla import cuit_valido, generar_plantilla, generar_plantilla_simple, leer_excel
@@ -82,8 +84,30 @@ with st.sidebar:
         ent = "🟢 prod" if c.get("entorno") == "produccion" else "🟡 homo"
         st.caption(f"{ent} · {c.get('razon_social')} ({c['cuit']})")
 
+def pesos(n) -> str:
+    return "$ " + f"{float(n):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fecha_cae(v: str) -> str:
+    v = str(v or "")
+    return f"{v[6:8]}/{v[4:6]}/{v[:4]}" if len(v) == 8 and v.isdigit() else v
+
+
+def ahora() -> str:
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M")
+
+
+def registrar_mail(cuit: str, razon: str, comprobante: str, pdf: str, para: str, cc: str, asunto: str,
+                   estado: str, detalle: str = ""):
+    try:
+        alm.tabla_agregar("Mails", {"id": uuid.uuid4().hex[:10], "fecha": ahora(), "cuit_emisor": cuit,
+                                    "razon_social": razon, "comprobante": comprobante, "pdf": pdf, "para": para,
+                                    "cc": cc, "asunto": asunto, "estado": estado, "detalle": detalle})
+    except Exception as ex:
+        st.warning(f"El mail se procesó pero no se pudo anotar en 'Mails enviados': {ex}")
+
+
 def _enviar_mails(res: list[dict], simulacion: bool, forzar: bool = False):
-    import datetime as _dt
     if simulacion:  # nunca mandar simulaciones a los receptores
         lote = [{**r, "emails": [cfg_mail.get("remitente_email")]} for r in res]
         mailer.enviar_lote({**cfg_mail, "copia_cliente": False, "copia_estudio": False}, lote, forzar)
@@ -91,13 +115,27 @@ def _enviar_mails(res: list[dict], simulacion: bool, forzar: bool = False):
             if l["mail"]:
                 r["mail"] = l["mail"] + " (simulación)"
         return
+    previos = {id(r): r.get("mail", "") for r in res}
     mailer.enviar_lote(cfg_mail, res, forzar)
     for r in res:
-        if r["mail"].startswith("Enviado") and r.get("pdf_nombre"):
-            alm.marcar_mail(r["pdf_nombre"], _dt.datetime.now().strftime("%d/%m/%Y %H:%M"))
+        if r.get("mail", "") == previos[id(r)] or not r.get("pdf_nombre"):
+            continue  # no se intentó en esta tanda
+        info = r.get("mail_info", {})
+        ok_m = r["mail"].startswith("Enviado")
+        registrar_mail(r["cuit"], r["cliente"], f"{r['tipo']} {r['pto_vta']:05d}-{r['numero']:08d}",
+                       r["pdf_nombre"], info.get("para", ", ".join(r["emails"])), info.get("cc", ""),
+                       info.get("asunto", ""), "Enviado" if ok_m else "Error", "" if ok_m else r["mail"])
+        if ok_m:
+            try:
+                alm.marcar_mail(r["pdf_nombre"], ahora())
+            except Exception:
+                pass
 
 
-tab_fact, tab_cli, tab_hist, tab_mail = st.tabs(["📤 Facturar", "👥 Clientes", "📚 Historial", "✉️ Mail"])
+tab_fact, tab_hist, tab_cc, tab_env, tab_conf = st.tabs(
+    ["📤 Facturar", "📚 Historial", "💰 Cuentas corrientes", "📨 Mails enviados", "⚙️ Configuración"])
+with tab_conf:
+    tab_cli, tab_mail = st.tabs(["👥 Clientes", "✉️ Mail"])
 
 # ================================================================== FACTURAR
 with tab_fact:
@@ -181,7 +219,7 @@ with tab_fact:
         if con_mail:
             if not mail_ok:
                 st.warning(f"{len(con_mail)} comprobante(s) tienen 'Enviar por mail' = S, pero el mail no está "
-                           "configurado (pestaña ✉️ Mail). Se emiten igual y los podés mandar después.")
+                           "configurado (⚙️ Configuración → ✉️ Mail). Se emiten igual y los podés mandar después.")
             elif simulacion:
                 auto_mail = st.checkbox(f"Mandarme la simulación a mí ({cfg_mail.get('remitente_email')}) para ver "
                                         "cómo llega el mail (no se envía a los receptores)")
@@ -190,30 +228,61 @@ with tab_fact:
                                         value=True)
         etiqueta = f"{'🧪 Simular' if simulacion else '🚀 Emitir'} {len(ok)} comprobante(s)"
         if st.button(etiqueta, type="primary", disabled=not ok or not confirmar):
-            barra = st.progress(0.0, "Comenzando…")
-            res = emitir_lote(ok, alm, simulacion, archivo.name,
-                              lambda i, n, t: barra.progress(i / n, f"{i}/{n} · {t}"))
-            barra.empty()
-            if auto_mail:
-                with st.spinner("Enviando mails…"):
+            verbo = "Simulando" if simulacion else "Autorizando en ARCA"
+            with st.status(f"⏳ {verbo}…", expanded=True) as estado:
+                barra = st.progress(0.0)
+                linea = st.empty()
+
+                def _avance(i, n, t):
+                    barra.progress((i - 1) / n)
+                    linea.markdown(f"**{i} de {n}** · {t}")
+                res = emitir_lote(ok, alm, simulacion, archivo.name, _avance)
+                barra.progress(1.0)
+                if auto_mail:
+                    estado.update(label="📧 Enviando mails…")
+                    linea.markdown("Enviando mails…")
                     _enviar_mails(res, simulacion)
+                n_ok = sum(1 for r in res if r["pdf"])
+                linea.empty()
+                estado.update(label=f"✅ Listo: {n_ok} de {len(res)} autorizado(s)" if n_ok == len(res)
+                              else f"⚠️ Terminado: {n_ok} de {len(res)} autorizado(s)",
+                              state="complete" if n_ok == len(res) else "error", expanded=False)
             st.session_state.resultados = res
             st.session_state.res_simulacion = simulacion
 
     res = st.session_state.get("resultados")
     if res:
-        st.subheader("Resultado")
+        st.divider()
         aut = [r for r in res if r["pdf"]]
-        st.success(f"Autorizados: {len(aut)} de {len(res)}") if aut else None
-        df = pd.DataFrame([{k: r[k] for k in ("estado", "id", "cliente", "tipo", "pto_vta", "numero", "total",
-                                               "cae", "cae_vto", "mail", "mensaje")} for r in res])
-        st.dataframe(df, hide_index=True, width="stretch")
+        sim_res = st.session_state.get("res_simulacion", False)
+        st.subheader("Resultado" + (" de la simulación" if sim_res else ""))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Autorizados", f"{len(aut)} de {len(res)}")
+        m2.metric("Total facturado", pesos(sum(r["total"] for r in aut)))
+        m3.metric("Con problemas", len(res) - len(aut))
+
         for r in res:
-            if r["estado"] in ("Rechazado", "Error"):
-                st.error(f"ID {r['id']} ({r['cliente']}): {r['mensaje']}")
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 1.4])
+                cb = r.get("cbte") or {}
+                if r["pdf"]:
+                    c1.markdown(f"### ✅ {r['tipo']} {r['pto_vta']:05d}-{r['numero']:08d}")
+                    c1.markdown(f"**{r['cliente']}** → {cb.get('rec_nombre') or 'Consumidor Final'}  \n"
+                                f"Total: **{pesos(r['total'])}**")
+                    c2.markdown(f"**CAE:** `{r['cae']}`  \n**Vto. CAE:** {fecha_cae(r['cae_vto'])}")
+                    if r.get("mail"):
+                        c2.caption(("📧 " if r["mail"].startswith("Enviado") else "⚠️ ") + r["mail"])
+                    c3.download_button("⬇️ PDF", r["pdf"], r["pdf_nombre"], "application/pdf",
+                                       key="pdfres_" + r["pdf_nombre"], width="stretch")
+                    if sim_res:
+                        c1.caption("🧪 Simulación: sin validez fiscal")
+                else:
+                    c1.markdown(f"### ❌ {r['tipo']} · ID {r['id']}")
+                    c1.markdown(f"**{r['cliente']}** · Total {pesos(r['total'])}")
+                    c2.error(r["mensaje"] or r["estado"])
+
         pend_mail = [r for r in aut if r["emails"] and not r["mail"].startswith("Enviado")]
         if pend_mail and mail_ok:
-            sim_res = st.session_state.get("res_simulacion", False)
             m1, m2 = st.columns([1, 2])
             solo_marcados = m2.checkbox("Solo los que tienen 'Enviar por mail' = S", value=True)
             if m1.button(f"📧 Enviar por mail ({len(pend_mail)})" + (" — a mí, es simulación" if sim_res else "")):
@@ -225,15 +294,18 @@ with tab_fact:
             with zipfile.ZipFile(z, "w") as zf:
                 for r in aut:
                     zf.writestr(r["pdf_nombre"], r["pdf"])
-            c1, c2 = st.columns(2)
-            c1.download_button("⬇️ Todos los PDF (.zip)", z.getvalue(), "comprobantes.zip", "application/zip")
+            df = pd.DataFrame([{"Estado": r["estado"], "Cliente": r["cliente"], "Tipo": r["tipo"],
+                                "Pto. venta": r["pto_vta"], "Número": r["numero"], "Total": r["total"],
+                                "CAE": r["cae"], "Vto. CAE": fecha_cae(r["cae_vto"]), "Mail": r["mail"],
+                                "Mensaje": r["mensaje"]} for r in res])
             xl = io.BytesIO()
             df.to_excel(xl, index=False, sheet_name="Resultado")
+            c1, c2, c3 = st.columns(3)
+            c1.download_button("⬇️ Todos los PDF (.zip)", z.getvalue(), "comprobantes.zip", "application/zip")
             c2.download_button("⬇️ Resultado en Excel", xl.getvalue(), "resultado_emision.xlsx")
-            with st.expander("Descargar PDF de a uno"):
-                for r in aut:
-                    st.download_button(r["pdf_nombre"], r["pdf"], r["pdf_nombre"], "application/pdf",
-                                       key="pdf_" + r["pdf_nombre"])
+            if c3.button("🧹 Limpiar y facturar otro"):
+                st.session_state.pop("resultados", None)
+                st.rerun()
 
 # ================================================================== CLIENTES
 with tab_cli:
@@ -441,24 +513,49 @@ with tab_cli:
                     st.rerun()
 
 # ================================================================== HISTORIAL
+def _comp(h: dict) -> str:
+    try:
+        return f"{h['tipo']} {int(float(h['pto_vta'])):05d}-{int(float(h['numero'])):08d}"
+    except (ValueError, KeyError):
+        return f"{h.get('tipo', '')} {h.get('pto_vta', '')}-{h.get('numero', '')}"
+
+
+def _fecha_orden(f: str):
+    try:
+        return dt.datetime.strptime(str(f).strip()[:10], "%d/%m/%Y")
+    except ValueError:
+        return dt.datetime.min
+
+
 with tab_hist:
     st.subheader("Comprobantes emitidos")
     h = alm.historial()
     if not h:
         st.info("Todavía no hay comprobantes emitidos (las simulaciones no se guardan).")
     else:
-        df = pd.DataFrame(h)
-        filtro = st.multiselect("Cliente", sorted(df["razon_social"].unique()))
-        if filtro:
-            df = df[df["razon_social"].isin(filtro)]
-        st.dataframe(df.drop(columns=["archivo_excel"]), hide_index=True, width="stretch")
+        filtro = st.multiselect("Cliente", sorted({x["razon_social"] for x in h}), key="hist_cli")
+        hf = [x for x in h if not filtro or x["razon_social"] in filtro]
+        hf = sorted(hf, key=lambda x: (_fecha_orden(x.get("fecha")), x.get("fecha_emision", "")), reverse=True)
+        vista = pd.DataFrame([{
+            "Fecha": x.get("fecha"), "Cliente": x.get("razon_social"), "Comprobante": _comp(x),
+            "Receptor": x.get("receptor") or ("Consumidor Final" if str(x.get("receptor_doc")) in ("0", "") else ""),
+            "CUIT/DNI": x.get("receptor_doc"), "Total": num(x.get("total")), "Moneda": x.get("moneda"),
+            "CAE": x.get("cae"), "Mail enviado": x.get("mail_enviado", ""), "Entorno": x.get("entorno"),
+        } for x in hf])
+        st.dataframe(vista, hide_index=True, width="stretch",
+                     column_config={"Total": st.column_config.NumberColumn(format="%.2f")})
         xl = io.BytesIO()
-        df.to_excel(xl, index=False)
+        pd.DataFrame(hf).to_excel(xl, index=False)
         st.download_button("⬇️ Historial en Excel", xl.getvalue(), "historial_facturas.xlsx")
-        registros = [f for f in df.to_dict("records") if f.get("pdf")]
+
+        st.markdown("#### Bajar o reenviar un comprobante")
+        registros = [x for x in hf if x.get("pdf")]
         if registros:
-            elegido_pdf = st.selectbox("Bajar o reenviar un PDF", [f["pdf"] for f in registros])
-            fila_h = next(f for f in registros if f["pdf"] == elegido_pdf)
+            etiquetas = {f"{_comp(x)} · {x.get('razon_social')} → {x.get('receptor') or x.get('receptor_doc')} · "
+                         f"{pesos(num(x.get('total')))}": x for x in registros}
+            elegido = st.selectbox("Comprobante", list(etiquetas))
+            fila_h = etiquetas[elegido]
+            elegido_pdf = fila_h["pdf"]
             if st.session_state.get("pdf_hist_nombre") != elegido_pdf:
                 st.session_state.pdf_hist_nombre = elegido_pdf
                 try:
@@ -467,23 +564,208 @@ with tab_hist:
                     st.session_state.pdf_hist = None
                     st.error(f"No pude traer el PDF: {ex}")
             pdf_bytes = st.session_state.get("pdf_hist")
+            c1, c2, c3 = st.columns([1.2, 3, 1])
             if pdf_bytes:
-                st.download_button("⬇️ " + elegido_pdf, pdf_bytes, elegido_pdf, "application/pdf")
+                c1.download_button("⬇️ Bajar PDF", pdf_bytes, elegido_pdf, "application/pdf")
             else:
-                st.caption("El PDF no está guardado en este lugar.")
-            dest = st.text_input("Reenviar por mail a", fila_h.get("email", "") or "", key="reenvio")
-            if st.button("📧 Reenviar", disabled=not (mail_ok and dest and pdf_bytes)):
+                c1.caption("El PDF no está guardado en este lugar.")
+            dest = c2.text_input("Reenviar por mail a", fila_h.get("email", "") or "", key="reenvio",
+                                 label_visibility="collapsed", placeholder="mail@cliente.com; otro@cliente.com")
+            if c3.button("📧 Reenviar", disabled=not (mail_ok and dest and pdf_bytes)):
+                destinos = [d.strip() for d in dest.replace(",", ";").split(";") if d.strip()]
+                cli_h = clientes.get(fila_h["cuit_emisor"], {})
+                msg = mailer.armar_mensaje(cfg_mail, mailer.datos_desde_historial(fila_h), cli_h,
+                                           pdf_bytes, elegido_pdf, destinos)
                 try:
-                    destinos = [d.strip() for d in dest.replace(",", ";").split(";") if d.strip()]
-                    cli_h = clientes.get(fila_h["cuit_emisor"], {})
                     with mailer.Mailer(cfg_mail) as m:
-                        m.enviar(mailer.armar_mensaje(cfg_mail, mailer.datos_desde_historial(fila_h), cli_h,
-                                                      pdf_bytes, elegido_pdf, destinos))
-                    import datetime as _dt
-                    alm.marcar_mail(elegido_pdf, _dt.datetime.now().strftime("%d/%m/%Y %H:%M"))
+                        m.enviar(msg)
+                    registrar_mail(fila_h["cuit_emisor"], fila_h.get("razon_social", ""), _comp(fila_h), elegido_pdf,
+                                   msg["To"], msg.get("Cc", "") or "", str(msg["Subject"]), "Enviado")
+                    alm.marcar_mail(elegido_pdf, ahora())
                     st.success("Enviado ✅")
                 except Exception as ex:
+                    registrar_mail(fila_h["cuit_emisor"], fila_h.get("razon_social", ""), _comp(fila_h), elegido_pdf,
+                                   msg["To"], msg.get("Cc", "") or "", str(msg["Subject"]), "Error", str(ex))
                     st.error(f"No se pudo enviar: {ex}")
+            if not mail_ok:
+                st.caption("Para reenviar por mail, configurá la casilla en ⚙️ Configuración → ✉️ Mail.")
+
+# ================================================================== MAILS ENVIADOS
+with tab_env:
+    st.subheader("Mails enviados")
+    try:
+        mails = alm.tabla_listar("Mails")
+    except Exception as ex:
+        mails = None
+        st.warning(str(ex))
+    if mails is not None:
+        if not mails:
+            st.info("Todavía no se envió ningún mail.")
+        else:
+            filtro_m = st.multiselect("Cliente", sorted({m.get("razon_social", "") for m in mails}), key="mail_cli")
+            ms = [m for m in mails if not filtro_m or m.get("razon_social") in filtro_m]
+            ms = sorted(ms, key=lambda m: (_fecha_orden(m.get("fecha")), m.get("fecha", "")), reverse=True)
+            st.dataframe(pd.DataFrame([{
+                "Fecha": m.get("fecha"), "Estado": ("✅ " if m.get("estado") == "Enviado" else "❌ ") + m.get("estado", ""),
+                "Cliente": m.get("razon_social"), "Comprobante": m.get("comprobante"), "Para": m.get("para"),
+                "Copia": m.get("cc"), "Asunto": m.get("asunto"), "Detalle": m.get("detalle"),
+            } for m in ms]), hide_index=True, width="stretch")
+            st.caption(f"{sum(1 for m in ms if m.get('estado') == 'Enviado')} enviados · "
+                       f"{sum(1 for m in ms if m.get('estado') != 'Enviado')} con error")
+
+# ================================================================== CUENTAS CORRIENTES
+MEDIOS_COBRO = ["Transferencia", "Efectivo", "Cheque", "E-cheq", "Mercado Pago", "Tarjeta de débito",
+                "Tarjeta de crédito", "Depósito", "Retenciones", "Compensación", "Otro"]
+
+with tab_cc:
+    st.subheader("Cuentas corrientes")
+    if not clientes:
+        st.info("Primero cargá un cliente en ⚙️ Configuración.")
+    else:
+        try:
+            cobros_todos = alm.tabla_listar("Cobros")
+        except Exception as ex:
+            cobros_todos = []
+            st.warning(str(ex))
+        op_cli = {f"{c.get('razon_social')} ({c['cuit']})": c["cuit"] for c in clientes.values()}
+        cuit_cc = op_cli[st.selectbox("Cliente del estudio", list(op_cli), key="cc_cli")]
+        hist_c = [x for x in alm.historial() if str(x.get("cuit_emisor")) == cuit_cc]
+        cob_c = [x for x in cobros_todos if str(x.get("cuit_emisor")) == cuit_cc]
+
+        def _clave_rec(doc):
+            d = str(doc or "").strip()
+            return "0" if d in ("", "0") else d
+
+        nombres = {}
+        for x in hist_c + cob_c:
+            k = _clave_rec(x.get("receptor_doc"))
+            if x.get("receptor"):
+                nombres[k] = x["receptor"]
+        nombres.setdefault("0", "Consumidor Final")
+
+        movs = []
+        for x in hist_c:
+            tot = num(x.get("total"))
+            es_nc = str(x.get("tipo", "")).startswith("NC")
+            movs.append({"fecha": x.get("fecha"), "doc": _clave_rec(x.get("receptor_doc")),
+                         "moneda": x.get("moneda") or "PES", "concepto": _comp(x),
+                         "debe": 0.0 if es_nc else tot, "haber": tot if es_nc else 0.0, "tipo": "NC" if es_nc else "F",
+                         "ref": x.get("pdf", "")})
+        for x in cob_c:
+            det = f"Cobro · {x.get('medio')}" + (f" · {x.get('referencia')}" if x.get("referencia") else "")
+            if x.get("aplica_a"):
+                det += f" (aplicado a {x['aplica_a']})"
+            movs.append({"fecha": x.get("fecha"), "doc": _clave_rec(x.get("receptor_doc")),
+                         "moneda": x.get("moneda") or "PES", "concepto": det, "debe": 0.0,
+                         "haber": num(x.get("importe")), "tipo": "C", "ref": x.get("id")})
+
+        # Resumen por receptor
+        resumen = {}
+        for mv in movs:
+            r = resumen.setdefault((mv["doc"], mv["moneda"]), {"fact": 0.0, "nc": 0.0, "cob": 0.0})
+            if mv["tipo"] == "F":
+                r["fact"] += mv["debe"]
+            elif mv["tipo"] == "NC":
+                r["nc"] += mv["haber"]
+            else:
+                r["cob"] += mv["haber"]
+        if not resumen:
+            st.info("Este cliente todavía no tiene facturas emitidas ni cobros cargados.")
+        else:
+            filas_res = [{"Receptor": nombres.get(d, ""), "CUIT/DNI": "" if d == "0" else d, "Moneda": mo,
+                          "Facturado": v["fact"], "Notas de crédito": v["nc"], "Cobrado": v["cob"],
+                          "Saldo": round(v["fact"] - v["nc"] - v["cob"], 2)} for (d, mo), v in resumen.items()]
+            filas_res.sort(key=lambda f: -f["Saldo"])
+            pes = [f for f in filas_res if f["Moneda"] == "PES"]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Facturado", pesos(sum(f["Facturado"] - f["Notas de crédito"] for f in pes)))
+            m2.metric("Cobrado", pesos(sum(f["Cobrado"] for f in pes)))
+            m3.metric("Saldo a cobrar", pesos(sum(f["Saldo"] for f in pes)))
+            fmt = {k: st.column_config.NumberColumn(format="%.2f")
+                   for k in ("Facturado", "Notas de crédito", "Cobrado", "Saldo")}
+            st.markdown("##### Saldos por receptor")
+            st.dataframe(pd.DataFrame(filas_res), hide_index=True, width="stretch", column_config=fmt)
+
+            st.markdown("##### Detalle de un receptor")
+            op_rec = {f"{nombres.get(d, '') or d} ({'CF' if d == '0' else d}) · {mo}": (d, mo) for (d, mo) in resumen}
+            d_sel, mo_sel = op_rec[st.selectbox("Receptor", list(op_rec), key="cc_rec")]
+            det = sorted([mv for mv in movs if mv["doc"] == d_sel and mv["moneda"] == mo_sel],
+                         key=lambda mv: (_fecha_orden(mv["fecha"]), mv["tipo"] == "C"))
+            saldo = 0.0
+            filas_det = []
+            for mv in det:
+                saldo += mv["debe"] - mv["haber"]
+                filas_det.append({"Fecha": mv["fecha"], "Concepto": mv["concepto"], "Debe": mv["debe"] or None,
+                                  "Haber": mv["haber"] or None, "Saldo": round(saldo, 2)})
+            st.dataframe(pd.DataFrame(filas_det), hide_index=True, width="stretch",
+                         column_config={k: st.column_config.NumberColumn(format="%.2f") for k in ("Debe", "Haber", "Saldo")})
+            xl = io.BytesIO()
+            with pd.ExcelWriter(xl) as wx:
+                pd.DataFrame(filas_res).to_excel(wx, index=False, sheet_name="Saldos")
+                pd.DataFrame(filas_det).to_excel(wx, index=False, sheet_name="Detalle receptor")
+            st.download_button("⬇️ Cuenta corriente en Excel", xl.getvalue(),
+                               f"cuenta_corriente_{cuit_cc}.xlsx")
+
+        # ---------------------------------------------------- registrar cobro
+        st.markdown("#### 💵 Registrar un cobro")
+        docs_rec = sorted({mv["doc"] for mv in movs if mv["tipo"] != "C"} | set(nombres),
+                          key=lambda d: (d == "0", nombres.get(d, d)))
+        receptores = {f"{nombres.get(d, '') or d} ({'CF' if d == '0' else d})": d for d in docs_rec}
+        rec_txt = st.selectbox("¿Quién pagó?", list(receptores) + ["➕ Otro (escribir abajo)"], key="cob_rec")
+        with st.form("form_cobro", clear_on_submit=True):
+            b, c = st.columns(2)
+            fecha_c = b.date_input("Fecha del cobro", dt.date.today(), format="DD/MM/YYYY")
+            importe_c = c.number_input("Importe", min_value=0.0, step=1000.0, format="%.2f")
+            a, b, c = st.columns([1.3, 1.3, 1.6])
+            medio_c = a.selectbox("Cómo pagó", MEDIOS_COBRO)
+            moneda_c = b.selectbox("Moneda", ["PES", "DOL"])
+            ref_c = c.text_input("Referencia (n° de operación, cheque…)")
+            rec_doc = receptores.get(rec_txt, "")
+            pendientes = [f"{mv['concepto']}" for mv in movs if mv["doc"] == rec_doc and mv["tipo"] == "F"]
+            aplica_c = st.selectbox("Aplicar a la factura", ["A cuenta (sin factura específica)"] + pendientes[::-1])
+            a, b = st.columns(2)
+            otro_nombre = a.text_input("Si es otro: nombre", "")
+            otro_doc = b.text_input("Si es otro: CUIT/DNI", "")
+            obs_c = st.text_input("Observaciones", "")
+            if st.form_submit_button("💾 Guardar cobro", type="primary"):
+                if rec_txt.startswith("➕"):
+                    rec_doc = "".join(ch for ch in otro_doc if ch.isdigit()) or "0"
+                    rec_nom = otro_nombre
+                else:
+                    rec_nom = nombres.get(rec_doc, "")
+                if importe_c <= 0:
+                    st.error("❌ El importe tiene que ser mayor a 0.")
+                elif rec_txt.startswith("➕") and not (otro_nombre or otro_doc):
+                    st.error("❌ Completá el nombre o el CUIT/DNI de quien pagó.")
+                else:
+                    try:
+                        alm.tabla_agregar("Cobros", {
+                            "id": uuid.uuid4().hex[:10], "fecha": fecha_c.strftime("%d/%m/%Y"),
+                            "cuit_emisor": cuit_cc, "receptor_doc": rec_doc, "receptor": rec_nom,
+                            "importe": f"{importe_c:.2f}", "moneda": moneda_c, "medio": medio_c,
+                            "referencia": ref_c, "observaciones": obs_c, "cargado": ahora(),
+                            "aplica_a": "" if aplica_c.startswith("A cuenta") else aplica_c})
+                        st.toast("✅ Cobro guardado")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"❌ No se pudo guardar: {ex}")
+
+        if cob_c:
+            with st.expander(f"Cobros cargados de este cliente ({len(cob_c)}) — corregir o borrar"):
+                st.dataframe(pd.DataFrame([{
+                    "Fecha": x.get("fecha"), "Receptor": x.get("receptor") or nombres.get(_clave_rec(x.get("receptor_doc")), ""),
+                    "Importe": num(x.get("importe")), "Moneda": x.get("moneda"), "Medio": x.get("medio"),
+                    "Referencia": x.get("referencia"), "Aplicado a": x.get("aplica_a"),
+                    "Observaciones": x.get("observaciones"), "Cargado": x.get("cargado"),
+                } for x in cob_c]), hide_index=True, width="stretch")
+                op_borrar = {f"{x.get('fecha')} · {x.get('receptor') or x.get('receptor_doc')} · "
+                             f"{pesos(num(x.get('importe')))} · {x.get('medio')}": x["id"] for x in cob_c}
+                a, b = st.columns([3, 1])
+                sel_b = a.selectbox("Cobro a borrar", list(op_borrar), key="cob_borrar")
+                if b.button("🗑️ Borrar cobro"):
+                    alm.tabla_eliminar("Cobros", op_borrar[sel_b])
+                    st.toast("Cobro borrado")
+                    st.rerun()
 
 # ================================================================== MAIL
 with tab_mail:

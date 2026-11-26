@@ -133,9 +133,11 @@ def enviar_lote(cfg: dict, resultados: list[dict], forzar_todos: bool = False) -
     try:
         with Mailer(cfg) as m:
             for r in pendientes:
+                msg = armar_mensaje(cfg, datos_plantilla(r["cbte"]), r["cbte"]["cliente"],
+                                    r["pdf"], r["pdf_nombre"], r["emails"])
+                r["mail_info"] = {"para": msg["To"], "cc": msg.get("Cc", "") or "", "asunto": str(msg["Subject"])}
                 try:
-                    m.enviar(armar_mensaje(cfg, datos_plantilla(r["cbte"]), r["cbte"]["cliente"],
-                                          r["pdf"], r["pdf_nombre"], r["emails"]))
+                    m.enviar(msg)
                     r["mail"] = "Enviado a " + ", ".join(r["emails"])
                 except Exception as ex:
                     r["mail"] = f"Error: {ex}"

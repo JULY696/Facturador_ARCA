@@ -19,6 +19,29 @@ COLS_HIST = ["fecha_emision", "entorno", "cuit_emisor", "razon_social", "tipo", 
              "receptor_doc", "receptor", "neto", "iva", "tributos", "total", "moneda", "cae", "cae_vto",
              "id_excel", "archivo_excel", "pdf", "email", "mail_enviado"]
 
+# Tablas extra (registro de mails y cobranzas)
+TABLAS = {
+    "Mails": ["id", "fecha", "cuit_emisor", "razon_social", "comprobante", "pdf", "para", "cc", "asunto",
+              "estado", "detalle"],
+    "Cobros": ["id", "fecha", "cuit_emisor", "receptor_doc", "receptor", "importe", "moneda", "medio",
+               "referencia", "aplica_a", "observaciones", "cargado"],
+}
+
+
+def num(v) -> float:
+    """Convierte números que pueden venir como '1234.5', '1.234,50' o 1234.5."""
+    if v in (None, ""):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip().replace("$", "").replace(" ", "")
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
 
 class Almacen:
     def __init__(self, base: Path, secretos: dict | None = None):
@@ -129,6 +152,30 @@ class Almacen:
             w.writeheader()
             for f in filas:
                 w.writerow({k: f.get(k, "") for k in COLS_HIST})
+
+    # ---------------------------------------------------------- tablas (mails, cobros)
+    def _ruta_tabla(self, tabla: str) -> Path:
+        return self.base / f"{tabla.lower()}.csv"
+
+    def tabla_listar(self, tabla: str) -> list[dict]:
+        ruta = self._ruta_tabla(tabla)
+        if not ruta.exists():
+            return []
+        with ruta.open(encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def _tabla_escribir(self, tabla: str, filas: list[dict]):
+        with self._ruta_tabla(tabla).open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=TABLAS[tabla], delimiter=";")
+            w.writeheader()
+            for fila in filas:
+                w.writerow({k: fila.get(k, "") for k in TABLAS[tabla]})
+
+    def tabla_agregar(self, tabla: str, fila: dict):
+        self._tabla_escribir(tabla, self.tabla_listar(tabla) + [fila])
+
+    def tabla_eliminar(self, tabla: str, id_: str):
+        self._tabla_escribir(tabla, [f for f in self.tabla_listar(tabla) if str(f.get("id")) != str(id_)])
 
     # ---------------------------------------------------------- mail
     @property
@@ -261,6 +308,31 @@ class AlmacenNube(Almacen):
     def marcar_mail(self, pdf: str, cuando: str):
         self._llamar("hist_marcar_mail", pdf=pdf, cuando=cuando)
         self._hist_cache = None
+
+    # ---------------------------------------------------------- tablas (mails, cobros)
+    def _tabla_llamar(self, accion: str, **datos):
+        try:
+            return self._llamar(accion, **datos)
+        except ErrorNube as ex:
+            if "is not a function" in str(ex) or "not a function" in str(ex):
+                raise ErrorNube("Hay que actualizar el Apps Script con la versión nueva (apps_script/Codigo.gs) "
+                                "para usar mails enviados y cuentas corrientes.")
+            raise
+
+    def tabla_listar(self, tabla: str) -> list[dict]:
+        cache = self.__dict__.setdefault("_tablas_cache", {})
+        if tabla not in cache:
+            cache[tabla] = self._tabla_llamar("tabla_listar", tabla=tabla, columnas=TABLAS[tabla]) or []
+        return cache[tabla]
+
+    def tabla_agregar(self, tabla: str, fila: dict):
+        self._tabla_llamar("tabla_agregar", tabla=tabla, columnas=TABLAS[tabla],
+                           fila={k: fila.get(k, "") for k in TABLAS[tabla]})
+        self.__dict__.setdefault("_tablas_cache", {}).pop(tabla, None)
+
+    def tabla_eliminar(self, tabla: str, id_: str):
+        self._tabla_llamar("tabla_eliminar", tabla=tabla, columnas=TABLAS[tabla], id=str(id_))
+        self.__dict__.setdefault("_tablas_cache", {}).pop(tabla, None)
 
     # ---------------------------------------------------------- mail
     def config_mail(self, secretos_mail: dict | None = None) -> dict:
